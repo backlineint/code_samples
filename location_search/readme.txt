@@ -1,1 +1,1 @@
-This repository contains snippets of JavaScript code related to a location based search.  Users can opt to share their location data, or can select their location using the geocomplete jQuery plugin.  The results interact with the Google Maps JavaScript API and are mapped accordingly.
+This directory contains snippets of JavaScript code related to a location based search.  Users can opt to share their location data, or can select their location using the geocomplete jQuery plugin.  The results interact with the Google Maps JavaScript API and are mapped accordingly.
