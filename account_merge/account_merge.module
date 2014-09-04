@@ -1,0 +1,403 @@
+<?php
+/**
+ * @file
+ * Code for Account Merge Feature
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function account_merge_permission() {
+  return array(
+    'merge accounts' => array(
+      'title' => t('Merge Accounts'),
+    ),
+  );
+}
+
+/**
+ * Implements hook_menu().
+ */
+function account_merge_menu() {
+  $items = array();
+
+  $items['admin/people/account-merge'] = array(
+    'title' => t('Merge accounts'),
+    'page callback' => 'drupal_get_form',
+    'page arguments' => array('account_merge_merge_form'),
+    'access callback' => 'user_access',
+    'access arguments' => array('merge accounts'),
+    'type' => MENU_LOCAL_TASK,
+  );
+
+  // Path with autocomplete function for cstkey
+  $items['ajax/cstkey/autocomplete'] = array(
+    'title' => t('Autocomplete for user by cstkey'),
+    'page callback' => '_cstkey_autocomplete',
+    'access arguments' => array('administer users'),
+    'type' => MENU_CALLBACK
+  );
+
+  return $items;
+}
+
+/**
+ * Form to collect the two user CST Keys.
+ */
+function account_merge_merge_form($form, &$form_state) {
+  // This is necessary, otherwise the title will show up as "People"
+  drupal_set_title(t('Merge accounts'));
+
+  $form['user_source'] = array(
+    '#type' => 'textfield',
+    '#title' => t('The CST Key of the account to delete'),
+    '#autocomplete_path' => 'ajax/cstkey/autocomplete',
+    '#required' => TRUE,
+  );
+
+  $form['user_destination'] = array(
+    '#type' => 'textfield',
+    '#title' => t('The CST Key of the account to keep'),
+    '#autocomplete_path' => 'ajax/cstkey/autocomplete',
+    '#required' => TRUE,
+  );
+
+  $form['submit'] = array(
+    '#type' => 'submit',
+    '#value' => t('Merge Accounts'),
+    '#submit' => array('account_merge_merge_form_submit')
+  );
+
+  return $form;
+}
+
+/**
+ * autocomplete helper for CST Key
+ * $string = string for search
+ */
+function _cstkey_autocomplete($string = '') {
+  $matches = array();
+  if ($string) {
+    $result = db_select('field_data_field_remote_profile_uid', 'cstkey')->fields('cstkey', array('field_remote_profile_uid_value'))->condition('field_remote_profile_uid_value', db_like($string) . '%', 'LIKE')->range(0, 10)->execute();
+    foreach ($result as $row) {
+      $matches[$row->field_remote_profile_uid_value] = check_plain($row->field_remote_profile_uid_value);
+    }
+  }
+
+  drupal_json_output($matches);
+}
+
+/**
+ * Handles the merging of Drupal accounts
+ */
+function account_merge_merge_form_submit($form, &$form_state) {
+  // Get the CST Key values from the Form
+  $cstkey_source = $form_state['values']['user_source'];
+  $cstkey_destination = $form_state['values']['user_destination'];
+  // Determine the username associated with the source CST Key
+  $source_query = db_select('users', 'u');
+  $source_query->join('field_data_field_remote_profile_uid', 'cstkey', 'u.uid=cstkey.entity_id');
+  $source_query->fields('u', array('name'));
+  $source_query->condition('cstkey.field_remote_profile_uid_value', $cstkey_source,'=');
+  $source_query->range(0,1);
+  $result = $source_query->execute();
+  foreach ($result as $row) {
+    $user_source = $row->name;
+  }
+  // Determine the username associated with the destination CST Key
+  $destination_query = db_select('users', 'u');
+  $destination_query->join('field_data_field_remote_profile_uid', 'cstkey', 'u.uid=cstkey.entity_id');
+  $destination_query->fields('u', array('name'));
+  $destination_query->condition('cstkey.field_remote_profile_uid_value', $cstkey_destination,'=');
+  $destination_query->range(0,1);
+  $result = $destination_query->execute();
+  foreach ($result as $row) {
+    $user_destination = $row->name;
+  }
+  // Load source and destination accounts
+  $account_source = user_load_by_name($user_source);
+  $account_destination = user_load_by_name($user_destination);
+  // Attempt to merge users
+  if (account_merge_merge_accounts($account_source, $account_destination)) {
+    drupal_set_message("{$cstkey_source} has been deleted.");
+    drupal_set_message("{$cstkey_destination} has been merged and updated for online account {$user_source}.");
+  }
+  else {
+    drupal_set_message('Merge can not be completed - user is not valid or an error was encountered during merge', 'error');
+  }
+}
+
+/**
+ * Helper validation function used by the form submit and the API.
+ *
+ * @param $source
+ *   Object of user to be deleted
+ * @param $destination
+ *   Object of user to be kept
+  * @return boolean
+ *   TRUE if the accounts can be merged, FALSE if the validation failed.
+ */
+function account_merge_validate_merge($source, $destination) {
+  $valid = TRUE;
+  if (empty($source->uid)) {
+    $valid = FALSE;
+  }
+
+  if (empty($destination->uid)) {
+    $valid = FALSE;
+  }
+
+  // Don't remove UID 1.
+  if ($source->uid == 1) {
+    $valid = FALSE;
+  }
+  return $valid;
+}
+
+/**
+ * Merges the selected accounts.
+ *
+ * @param object $source
+ *   A fully loaded user object from user_load() that will be merged and deleted.
+ * @param object $destination
+ *   A fully loaded user object from user_load() that will be merged and retained.
+ * @return boolean
+ *   TRUE if they are merged, FALSE if the validation failed.
+ */
+function account_merge_merge_accounts($source, $destination) {
+  if (account_merge_validate_merge($source, $destination)) {
+    // Create a transaction so that any failure will cause the entire merge to rollback.
+    $transaction = db_transaction();
+    try {
+      // Update the username and email of the destination account to match the source
+      $destination->name = $source->name;
+      $destination->mail = $source->mail;
+      // If destination doesn't already have a photo, use the source photo
+      if (empty($destination->picture) && !empty($source->picture)) {
+        $destination->picture = $source->picture;
+      }
+      // If destination doesn't have a custom location, use the source location
+      if (!isset($destination->data['geoip_location']) && isset($source->data['geoip_location'])) {
+        $destination->data['geoip_location'] = $source->data['geoip_location'];
+      }
+      // If source opted out of notifications, update destination accordingly
+      $source_notifications = db_select('subscriptions_user', 's')
+        ->fields('s', array('suspended'))
+        ->condition('uid', $source->uid)
+        ->execute()
+        ->fetchField();
+      $destination_notifications = db_select('subscriptions_user', 's')
+        ->fields('s', array('suspended'))
+        ->condition('uid', $destination->uid)
+        ->execute()
+        ->fetchField();
+      if ($source_notifications == 1 && $destination_notifications == 0) {
+        db_update('subscriptions_user')
+          ->fields(array('suspended' => 1))
+          ->condition('uid', $destination->uid)
+          ->execute();
+      }
+      // Housekeeping - update file ownership (mainly for sake of profile photo)
+      db_update('file_managed')
+        ->fields(array('uid' => $destination->uid))
+        ->condition('uid', $source->uid)
+        ->execute();
+      // Merge all pending or active connections from source into destination.
+      $source_relationships = user_relationships_load(array("user" => $source->uid));
+      // Get all uids who destination requested connections with
+      $destination_requestees = db_select('user_relationships', 'r')
+        ->fields('r', array('requestee_id'))
+        ->condition('requester_id', $destination->uid)
+        ->execute()
+        ->fetchCol('requestee_id');
+      // Get all uids who requested connections with destination
+      $destination_requesters = db_select('user_relationships', 'r')
+        ->fields('r', array('requester_id'))
+        ->condition('requestee_id', $destination->uid)
+        ->execute()
+        ->fetchCol('requester_id');
+      global $user;
+      if (!empty($source_relationships)) {
+        foreach ($source_relationships as $relationship) {
+          // If source has a connection with destination (or vice versa,) discard it.
+          if (($relationship->requester_id == $source->uid && $relationship->requestee_id == $destination->uid) || ($relationship->requester_id == $destination->uid && $relationship->requestee_id == $source->uid)) {
+            user_relationships_delete_relationship($relationship, $user, 'remove');
+          }
+          else {
+            // Update unique connections where source was requester
+            if ($relationship->requester_id == $source->uid && array_search($relationship->requestee_id, $destination_requestees) === FALSE && array_search($relationship->requestee_id, $destination_requesters) === FALSE) {
+              $relationship->requester_id = $destination->uid;
+              user_relationships_save_relationship($relationship, 'update');
+            }
+            // Update unique connections where source was requestee
+            else if ($relationship->requestee_id == $source->uid && array_search($relationship->requester_id, $destination_requesters) === FALSE && array_search($relationship->requester_id, $destination_requestees) === FALSE) {
+              $relationship->requestee_id = $destination->uid;
+              user_relationships_save_relationship($relationship, 'update');
+            }
+            // For exact or directionally duplicate connections, discard the source connection
+            else {
+              user_relationships_delete_relationship($relationship, $user, 'remove');
+            }
+          }
+        }
+      }
+      // Merge all sent and received private messages from source to destination
+      // Merge sent messages
+      db_update('pm_message')
+        ->fields(array('author' => $destination->uid))
+        ->condition('author', $source->uid)
+        ->execute();
+      // Merge inbox
+      $destination_mids = db_select('pm_index', 'p')
+        ->fields('p', array('mid'))
+        ->condition('recipient', $destination->uid)
+        ->execute()
+        ->fetchCol('mid');
+      // If destination_mids query returns no results, set to an ID that doesn't exist
+      if (empty($destination_mids)) {
+        $destination_mids = array(0);
+      }
+      // Merge messages that only exist in source account.
+      db_update('pm_index')
+        ->fields(array('recipient' => $destination->uid))
+        ->condition('recipient', $source->uid)
+        ->condition('mid', $destination_mids, 'NOT IN')
+        ->execute();
+      // Delete any duplicate messages from source
+      db_delete('pm_index')
+        ->condition('recipient', $source->uid)
+        ->execute();
+      // Merge Inbox Tags
+      $destination_threads = db_select('pm_tags_index', 't')
+        ->fields('t', array('thread_id'))
+        ->condition('uid', $destination->uid)
+        ->execute()
+        ->fetchCol('thread_id');
+      // If destination_threads query returns no results, set to an ID that doesn't exist
+      if (empty($destination_threads)) {
+        $destination_threads = array(0);
+      }
+      // Merge message tags that only exist in source account.
+      db_update('pm_tags_index')
+        ->fields(array('uid' => $destination->uid))
+        ->condition('uid', $source->uid)
+        ->condition('thread_id', $destination_threads, 'NOT IN')
+        ->execute();
+      // Delete any duplicate message tags from source
+      db_delete('pm_tags_index')
+        ->condition('uid', $source->uid)
+        ->execute();
+      // Merge groups data from source to destination
+      // Merge group memberships
+      $source_memberships = og_membership_load_multiple(FALSE, array('etid' => $source->uid, 'entity_type' => 'user'));
+      $destination_gids = db_select('og_membership', 'm')
+        ->fields('m', array('gid'))
+        ->condition('etid', $destination->uid)
+        ->execute()
+        ->fetchCol('gid');
+      if (!empty($source_memberships)) {
+        foreach ($source_memberships as $membership) {
+          if (array_search($membership->gid, $destination_gids) === FALSE) {
+            $membership->etid = $destination->uid;
+            if (og_membership_save($membership) === FALSE) {
+              throw new Exception("Group membership save failed");
+            }
+            // Also add this membership to the user object
+            array_push($destination->og_user_node['und'], array("target_id" => $membership->gid));
+          }
+          else {
+            og_membership_delete($membership->id);
+            if (og_membership_load($membership->id) != NULL) {
+              throw new Exception("Group membership delete failed");
+            }
+          }
+        }
+      }
+      // Merge any groups or group discussions owned by the source account
+      $source_groups = node_load_multiple(FALSE, array('uid' => $source->uid, 'type' => 'group'));
+      if (!empty($source_groups)) {
+        foreach ($source_groups as $group) {
+          $group->uid = $destination->uid;
+          node_save($group);
+          if (node_load_multiple(array($group->nid), array('uid' => $destination->uid, 'type' => 'group')) == NULL) {
+            throw new Exception("Group save failed");
+          }
+        }
+      }
+      $source_discussions = node_load_multiple(FALSE, array('uid' => $source->uid, 'type' => 'group_discussion'));
+      if (!empty($source_discussions)) {
+        foreach ($source_discussions as $discussion) {
+          $discussion->uid = $destination->uid;
+          node_save($discussion);
+          if (node_load_multiple(array($discussion->nid), array('uid' => $destination->uid, 'type' => 'group_discussion')) == NULL) {
+            throw new Exception("Group discussion save failed");
+          }
+        }
+      }
+      // Merge group roles - this only really applies to group admins who do not own the group
+      $destination_gids = db_select('og_users_roles', 'r')
+        ->fields('r', array('gid'))
+        ->condition('uid', $destination->uid)
+        ->execute()
+        ->fetchCol('gid');
+      // If destination_gids query returns no results, set to an ID that doesn't exist
+      if (empty($destination_gids)) {
+        $destination_gids = array(0);
+      }
+      db_update('og_users_roles')
+        ->fields(array('uid' => $destination->uid))
+        ->condition('uid', $source->uid)
+        ->condition('gid', $destination_gids, 'NOT IN')
+        ->execute();
+      // Delete any duplicate roles from source
+      db_delete('og_users_roles')
+        ->condition('uid', $source->uid)
+        ->execute();
+      // Merge group comments
+      $source_comments = comment_load_multiple(FALSE, array('uid' => $source->uid));
+      if (!empty($source_comments)) {
+        foreach ($source_comments as $comment) {
+          $comment->uid = $destination->uid;
+          comment_save($comment);
+          if (comment_load_multiple(array($comment->cid), array('uid' => $destination->uid)) == NULL) {
+            throw new Exception("Comment save failed");
+          }
+        }
+      }
+      // Merge webform submissions history
+      db_update('webform_submissions')
+        ->fields(array('uid' => $destination->uid))
+        ->condition('uid', $source->uid)
+        ->execute();
+      // Invalidate any sessions for source or destination
+      $or = db_or()->condition('uid', $source->uid)->condition('uid', $destination->uid);
+      db_delete('sessions')->condition($or)->execute();
+      // Delete the source account
+      // Since both accounts use the same username/email we need to delete the source before saving the destination.
+      user_delete($source->uid);
+      if (user_load($source->uid) != FALSE) {
+        throw new Exception("User delete failed");
+      }
+      // Delete data from custom tables
+      db_delete('privacy')
+        ->condition('uid', $source->uid)
+        ->execute();
+      db_delete('security_flag')
+        ->condition('uid', $source->uid)
+        ->execute();
+
+      // Save the newly merged destination account
+      if (user_save($destination) == FALSE) {
+        throw new Exception("User save failed");
+      }
+      return TRUE;
+    }
+    catch (Exception $e) {
+      $transaction->rollback();
+      watchdog('account_merge', 'Exception encountered during account merge (from @source to @destination): %exception. No merge occurred: merge progress was rolled back.', array('@source' => $source->uid, '@destination' => $destination->uid, '%exception' => $e), WATCHDOG_ERROR);
+    }
+  }
+  else {
+    return FALSE;
+  }
+}

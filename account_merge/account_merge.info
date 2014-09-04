@@ -1,0 +1,9 @@
+name = Account Merge
+description = Merge related user accounts
+core = 7.x
+version = 7.x-1.0
+project = account_merge
+dependencies[] = *****_connections
+dependencies[] = *****_groups
+dependencies[] = *****_messaging
+dependencies[] = *****_user_profile_fields
